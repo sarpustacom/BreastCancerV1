@@ -1,0 +1,2 @@
+Dataset is required, but not included. Download BreaKHis_v1 dataset and move "benign" and "malignant" folders inside "BreaKHis_v1/histology_slides/breast" path.
+Do not forget to create venv for clean work and installed all libraries inside requirements.txt
