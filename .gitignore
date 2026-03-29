@@ -2,3 +2,5 @@ BreaKHis_v1/histology_slides/breast/benign/
 BreaKHis_v1/histology_slides/breast/malignant/
 venv/
 best_model.keras
+best_model_classification.keras
+models/
