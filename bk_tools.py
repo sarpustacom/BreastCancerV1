@@ -1,56 +1,105 @@
 import glob
 import os
+from pathlib import Path
 import random
 import tensorflow as tf
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+BASE_DIR = Path(__file__).resolve().parent
+path_db = BASE_DIR / "BreaKHis_v1" / "histology_slides" / "breast"
+
+
 def packup_details(f):
-    # Extract details from the file path and name
-    parts = f.split("/")[-1].split("_")
-    example = parts[0] # Generally -> SOB
-    is_malign = (1 if parts[1] == "M" else 0 ) # M -> Malignant, B -> Benign
+    p = Path(f)
+
+    # only filename, cross-platform safe
+    filename = p.name                          # SOB_B_A-14-22549G-100-001.png
+    stem = p.stem                             # SOB_B_A-14-22549G-100-001
+
+    parts = stem.split("_")
+    if len(parts) < 3:
+        raise ValueError(f"Unexpected filename format: {filename}")
+
+    example = parts[0]                        # SOB
+    is_malign = 1 if parts[1] == "M" else 0   # M -> malignant, B -> benign
+
     names = parts[2].split("-")
-    class_tumor = names[0] # A, F, P, S
-    year = int(names[1]) + 2000 # 2014
-    patient_id = names[2] # 9212
-    zoom = int(names[3]) # 200
-    file_id = names[4].split(".")[0] # 001
-    # Pack the details into a dictionary
+    if len(names) < 5:
+        raise ValueError(f"Unexpected tumor name format: {filename}")
+
+    class_tumor = names[0]
+    year = int(names[1]) + 2000
+    patient_id = names[2]
+    zoom = int(names[3])
+    file_id = names[4]
+
     return {
-        "patient_id":patient_id,
-        "file_id":file_id,
-        "example":example,
-        "class":class_tumor,
-        "year":year,
-        "zoom":zoom, 
-        "file_path":f,
-        "is_malign":is_malign
+        "patient_id": patient_id,
+        "file_id": file_id,
+        "example": example,
+        "class": class_tumor,
+        "year": year,
+        "zoom": zoom,
+        "file_path": str(p),
+        "is_malign": is_malign,
     }
 
-def print_file_details(f):
-    # Get the file name and split it to extract details (Only for testing purposes)
-    parts = f.split("/")[-1].split("_")
-    print("Type of example: ", parts[0])
-    print("State: ",parts[1], " (", 1 if parts[1] == 'M' else 0, ")")
-    nm = parts[2].split("-")
-    print("Class: ", nm[0])
-    print("Year: ", nm[1])
-    print("Patient ID: ", nm[2])
-    print("Zoom: ", nm[3])
-    print("File ID: ", nm[4].split(".")[0])
 
-def prepare_data_table(rootpath: str = "BreaKHis_v1/histology_slides/breast") -> pd.DataFrame:
-    # Use glob to find all PNG files in the directory and subdirectories
-    files = glob.glob(os.path.join(rootpath,"**/**.png"), recursive=True)
-    # Pack the details of each file into a list of dictionaries
-    datas = [packup_details(f) for f in files]
-    # Create a DataFrame from the list of dictionaries
+def print_file_details(f):
+    p = Path(f)
+    filename = p.name
+    stem = p.stem
+
+    parts = stem.split("_")
+    if len(parts) < 3:
+        raise ValueError(f"Unexpected filename format: {filename}")
+
+    print("Type of example:", parts[0])
+    print("State:", parts[1], "(", 1 if parts[1] == "M" else 0, ")")
+
+    nm = parts[2].split("-")
+    if len(nm) < 5:
+        raise ValueError(f"Unexpected tumor name format: {filename}")
+
+    print("Class:", nm[0])
+    print("Year:", nm[1])
+    print("Patient ID:", nm[2])
+    print("Zoom:", nm[3])
+    print("File ID:", nm[4])
+
+
+def prepare_data_table(rootpath=path_db) -> pd.DataFrame:
+    rootpath = Path(rootpath)
+
+    # cross-platform recursive PNG search
+    files = list(rootpath.rglob("*.png"))
+
+    if not files:
+        raise FileNotFoundError(f"No PNG files found under: {rootpath}")
+
+    datas = []
+    bad_files = []
+
+    for f in files:
+        try:
+            datas.append(packup_details(f))
+        except Exception as e:
+            bad_files.append((str(f), str(e)))
+
     df = pd.DataFrame(datas)
-    # Check the structure of the DataFrame
+
     print("DataFrame shape:", df.shape)
-    print("DataFrame columns:", df.columns)
+    print("DataFrame columns:", df.columns.tolist())
+    print("Parsed files:", len(datas))
+    print("Failed files:", len(bad_files))
+
+    if bad_files:
+        print("\nFirst 10 problematic files:")
+        for fp, err in bad_files[:10]:
+            print(fp, "->", err)
+
     return df
 
 def prepare_data_splitting(df: pd.DataFrame, chosen_zoom: int = 200, test_val_size: int = 0.2 ):   
@@ -496,3 +545,94 @@ def prepare_coverage_optimized_split(
     print(best_info)
 
     return best_split
+
+
+def prepare_image_level_split(
+    df: pd.DataFrame,
+    chosen_zoom: int = 200,
+    test_size: float = 0.15,
+    val_size: float = 0.15,
+    seed: int = 42
+):
+    """
+    Image-level stratified split for multiclass classification.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain at least ['class', 'zoom'] and file path column.
+    chosen_zoom : int
+        Zoom level to filter.
+    test_size : float
+        Final test ratio.
+    val_size : float
+        Final validation ratio.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    train_df, val_df, test_df
+    """
+    set_seeds(seed)
+
+    df_zoom = df[df["zoom"] == chosen_zoom].copy().reset_index(drop=True)
+
+    if df_zoom.empty:
+        raise ValueError(f"No samples found for zoom={chosen_zoom}")
+
+    print(f"Selected zoom: {chosen_zoom}")
+    print(f"Total images: {len(df_zoom)}")
+    print("\nClass distribution before split:")
+    print(df_zoom["class"].value_counts())
+
+    # First split: train vs temp
+    train_df, temp_df = train_test_split(
+        df_zoom,
+        test_size=(val_size + test_size),
+        stratify=df_zoom["class"],
+        random_state=seed,
+        shuffle=True
+    )
+
+    # Relative test size inside temp
+    relative_test_size = test_size / (val_size + test_size)
+
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=relative_test_size,
+        stratify=temp_df["class"],
+        random_state=seed,
+        shuffle=True
+    )
+
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    print("\nSplit sizes:")
+    print("Train:", len(train_df))
+    print("Val  :", len(val_df))
+    print("Test :", len(test_df))
+
+    print("\nTrain class distribution:")
+    print(train_df["class"].value_counts())
+
+    print("\nVal class distribution:")
+    print(val_df["class"].value_counts())
+
+    print("\nTest class distribution:")
+    print(test_df["class"].value_counts())
+
+    # Optional leakage check
+    if "patient_id" in df_zoom.columns:
+        train_patients = set(train_df["patient_id"].unique())
+        val_patients = set(val_df["patient_id"].unique())
+        test_patients = set(test_df["patient_id"].unique())
+
+        print("\nPatient overlap check (expected in image-level split):")
+        print("Train-Val overlap :", len(train_patients & val_patients))
+        print("Train-Test overlap:", len(train_patients & test_patients))
+        print("Val-Test overlap  :", len(val_patients & test_patients))
+
+    return train_df, val_df, test_df
