@@ -103,7 +103,7 @@ def prepare_data_table(rootpath=path_db) -> pd.DataFrame:
     return df
 
 def prepare_data_splitting(df: pd.DataFrame, chosen_zoom: int = 200, test_val_size: int = 0.2 ):   
-    __init__() # Set seeds for reproducibility
+    set_seeds() # Set seeds for reproducibility
 
     # Choose the zoom level to work with 
     df_zoom = df[df["zoom"] == chosen_zoom].copy()
@@ -144,18 +144,14 @@ def prepare_data_splitting(df: pd.DataFrame, chosen_zoom: int = 200, test_val_si
     return train_df_200, val_df_200, test_df_200
 
 
-def __init__():
+def set_seeds(seed: int = 42):
     SEED = 42
     os.environ["PYTHONHASHSEED"] = str(SEED)
-    random.seed(SEED)
-    np.random.seed(SEED)
-    tf.random.set_seed(SEED)
-
-
-def set_seeds(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
+
+
 
 
 def prepare_data_splitting_class(
@@ -636,3 +632,350 @@ def prepare_image_level_split(
         print("Val-Test overlap  :", len(val_patients & test_patients))
 
     return train_df, val_df, test_df
+
+
+def prepare_data_splitting_class_v2(
+    df: pd.DataFrame,
+    chosen_zoom: int = None,
+    temp_size: float = 0.2,
+    seed: int = 42
+):
+    """
+    Patient-wise data splitting for multiclass classification.
+
+    Steps:
+    1. Optionally filter data by zoom level.
+    2. Remove patients that have multiple class labels (with warning).
+    3. Perform patient-level split to avoid data leakage.
+    4. Use stratification when possible, fall back otherwise.
+    5. Assign integer labels and return class mapping.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe. Must contain:
+        ['patient_id', 'class', 'zoom', 'file_path']
+    chosen_zoom : int or None, default=None
+        Zoom level to filter. If None, all zoom levels are used.
+    temp_size : float, default=0.2
+        Fraction reserved for val + test pool.
+        Example:
+            0.2 -> ~80% train, ~10% val, ~10% test
+    seed : int, default=42
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    train_df : pd.DataFrame
+    val_df   : pd.DataFrame
+    test_df  : pd.DataFrame
+    class_to_idx : dict
+        Mapping from class name to integer label.
+    """
+
+    set_seeds(seed)
+
+    # --------------------------------------------------
+    # 1. Zoom filtresi (opsiyonel)
+    # --------------------------------------------------
+    if chosen_zoom is not None:
+        df_zoom = df[df["zoom"] == chosen_zoom].copy().reset_index(drop=True)
+        if df_zoom.empty:
+            raise ValueError(f"No samples found for zoom={chosen_zoom}")
+        print(f"\nSelected zoom: {chosen_zoom}")
+    else:
+        df_zoom = df.copy().reset_index(drop=True)
+        print("\nNo zoom filter applied — using all zoom levels.")
+
+    print(f"Total samples : {len(df_zoom)}")
+    print(f"Unique patients: {df_zoom['patient_id'].nunique()}")
+    print("\nInitial image-level class distribution:")
+    print(df_zoom["class"].value_counts())
+
+    # --------------------------------------------------
+    # 2. Birden fazla sınıfı olan hastaları çıkar
+    # --------------------------------------------------
+    patient_class_counts = df_zoom.groupby("patient_id")["class"].nunique()
+    problematic_patients = patient_class_counts[patient_class_counts > 1].index.tolist()
+
+    if len(problematic_patients) > 0:
+        removed_images = df_zoom[df_zoom["patient_id"].isin(problematic_patients)].shape[0]
+        print(f"\n[WARNING] {len(problematic_patients)} patient(s) with multiple classes found.")
+        print(f"          Removing {removed_images} images ({removed_images/len(df_zoom)*100:.1f}% of data).")
+        print(f"          Problematic patient IDs: {problematic_patients}")
+        df_zoom = df_zoom[~df_zoom["patient_id"].isin(problematic_patients)].copy().reset_index(drop=True)
+    else:
+        print("\nNo patients with multiple classes found.")
+
+    if df_zoom.empty:
+        raise ValueError("No samples left after removing problematic patients.")
+
+    # --------------------------------------------------
+    # 3. Hasta bazlı dataframe oluştur
+    # --------------------------------------------------
+    patient_level_df = (
+        df_zoom[["patient_id", "class"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    print("\nClean patient-level class distribution:")
+    print(patient_level_df["class"].value_counts())
+
+    # Güvenlik kontrolü
+    check = patient_level_df.groupby("patient_id")["class"].nunique()
+    if (check > 1).any():
+        raise ValueError("Some patients still have multiple classes after cleaning.")
+
+    # --------------------------------------------------
+    # 4. Birinci split: Train / Temp
+    # --------------------------------------------------
+    class_counts = patient_level_df["class"].value_counts()
+
+    if class_counts.min() >= 2:
+        print("\nFirst split: stratified")
+        train_p, tmp_p = train_test_split(
+            patient_level_df["patient_id"],
+            test_size=temp_size,
+            stratify=patient_level_df["class"],
+            random_state=seed
+        )
+    else:
+        print("\nFirst split: non-stratified fallback (some classes have < 2 patients)")
+        train_p, tmp_p = train_test_split(
+            patient_level_df["patient_id"],
+            test_size=temp_size,
+            random_state=seed
+        )
+
+    tmp_patients = patient_level_df[patient_level_df["patient_id"].isin(tmp_p)].copy()
+
+    print("\nTemp pool patient-level class distribution (val + test):")
+    print(tmp_patients["class"].value_counts())
+
+    # --------------------------------------------------
+    # 5. İkinci split: Val / Test
+    # --------------------------------------------------
+    if len(tmp_patients) < 2:
+        raise ValueError("Temp pool is too small to split into validation and test sets.")
+
+    tmp_counts = tmp_patients["class"].value_counts()
+
+    if tmp_counts.min() >= 2:
+        print("\nSecond split: stratified")
+        val_p, test_p = train_test_split(
+            tmp_patients["patient_id"],
+            test_size=0.5,
+            stratify=tmp_patients["class"],
+            random_state=seed
+        )
+    else:
+        print("\nSecond split: non-stratified fallback (some classes have < 2 patients in temp pool)")
+        val_p, test_p = train_test_split(
+            tmp_patients["patient_id"],
+            test_size=0.5,
+            random_state=seed
+        )
+
+    # --------------------------------------------------
+    # 6. Final dataframe'leri oluştur
+    # --------------------------------------------------
+    train_df = df_zoom[df_zoom["patient_id"].isin(train_p)].reset_index(drop=True)
+    val_df   = df_zoom[df_zoom["patient_id"].isin(val_p)].reset_index(drop=True)
+    test_df  = df_zoom[df_zoom["patient_id"].isin(test_p)].reset_index(drop=True)
+
+    # --------------------------------------------------
+    # 7. Sızıntı kontrolü
+    # --------------------------------------------------
+    train_patients = set(train_df["patient_id"].unique())
+    val_patients   = set(val_df["patient_id"].unique())
+    test_patients  = set(test_df["patient_id"].unique())
+
+    tv_overlap  = train_patients & val_patients
+    tt_overlap  = train_patients & test_patients
+    vt_overlap  = val_patients  & test_patients
+
+    print("\nPatient overlap check (must all be empty):")
+    print(f"  Train-Val overlap : {tv_overlap  if tv_overlap  else 'None — OK'}")
+    print(f"  Train-Test overlap: {tt_overlap  if tt_overlap  else 'None — OK'}")
+    print(f"  Val-Test overlap  : {vt_overlap  if vt_overlap  else 'None — OK'}")
+
+    if tv_overlap or tt_overlap or vt_overlap:
+        raise ValueError("Data leakage detected! Patient overlap between splits.")
+
+    # --------------------------------------------------
+    # 8. Label mapping
+    # --------------------------------------------------
+    class_names  = sorted(df_zoom["class"].unique())
+    class_to_idx = {cls: idx for idx, cls in enumerate(class_names)}
+    idx_to_class = {idx: cls for cls, idx in class_to_idx.items()}
+
+    train_df = train_df.copy()
+    val_df   = val_df.copy()
+    test_df  = test_df.copy()
+
+    train_df["label"] = train_df["class"].map(class_to_idx)
+    val_df["label"]   = val_df["class"].map(class_to_idx)
+    test_df["label"]  = test_df["class"].map(class_to_idx)
+
+    # --------------------------------------------------
+    # 9. Özet rapor
+    # --------------------------------------------------
+    print("\n" + "="*50)
+    print("SPLIT SUMMARY")
+    print("="*50)
+    print(f"{'Split':<12} {'Patients':>10} {'Images':>10}")
+    print("-"*35)
+    print(f"{'Train':<12} {len(train_patients):>10} {len(train_df):>10}")
+    print(f"{'Validation':<12} {len(val_patients):>10} {len(val_df):>10}")
+    print(f"{'Test':<12} {len(test_patients):>10} {len(test_df):>10}")
+    print(f"{'Total':<12} {len(train_patients|val_patients|test_patients):>10} {len(df_zoom):>10}")
+    print("="*50)
+
+    print("\nClass label mapping:")
+    for cls, idx in class_to_idx.items():
+        print(f"  {cls} -> {idx}")
+
+    print("\nImage-level class distribution per split:")
+    for split_name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        print(f"\n{split_name}:")
+        print(split_df["class"].value_counts().to_string())
+
+    return train_df, val_df, test_df, class_to_idx
+
+
+def prepare_data_splitting_class_v3(
+    df: pd.DataFrame,
+    chosen_zoom: int = None,
+    temp_size: float = 0.2,
+    seed: int = 42,
+    expected_classes: list = None
+):
+    """
+    V3: Patient-wise data splitting with guaranteed stratification and static label mapping.
+    """
+    set_seeds(seed)
+
+    # BreaKHis veri seti için varsayılan sınıflar (Statik Mapping için zorunlu)
+    if expected_classes is None:
+        expected_classes = ['A', 'DC', 'F', 'LC', 'MC', 'PC', 'PT', 'TA']
+
+    # --------------------------------------------------
+    # 1. Robust Zoom Filtresi (Tip uyuşmazlığını çözer)
+    # --------------------------------------------------
+    if chosen_zoom is not None:
+        # "200" ve "200X" gibi string/int karmaşasını çözmek için string contains kullanılır
+        zoom_str = str(chosen_zoom).replace("X", "").replace("x", "")
+        df_zoom = df[df["zoom"].astype(str).str.contains(zoom_str, case=False, na=False)].copy().reset_index(drop=True)
+        
+        if df_zoom.empty:
+            raise ValueError(f"[HATA] Zoom seviyesi '{chosen_zoom}' için hiçbir veri bulunamadı!")
+        print(f"\n[BİLGİ] Seçilen zoom seviyesi: {chosen_zoom}")
+    else:
+        df_zoom = df.copy().reset_index(drop=True)
+        print("\n[BİLGİ] Zoom filtresi uygulanmadı — tüm veriler kullanılıyor.")
+
+    print(f"Toplam Görüntü: {len(df_zoom)}")
+    print(f"Eşsiz Hasta Sayısı: {df_zoom['patient_id'].nunique()}")
+
+    # --------------------------------------------------
+    # 2. Birden fazla sınıfı olan hastaları çıkar
+    # --------------------------------------------------
+    patient_class_counts = df_zoom.groupby("patient_id")["class"].nunique()
+    problematic_patients = patient_class_counts[patient_class_counts > 1].index.tolist()
+
+    if len(problematic_patients) > 0:
+        removed_images = df_zoom[df_zoom["patient_id"].isin(problematic_patients)].shape[0]
+        print(f"\n[UYARI] {len(problematic_patients)} hasta birden fazla sınıfa sahip. Temizleniyor...")
+        df_zoom = df_zoom[~df_zoom["patient_id"].isin(problematic_patients)].copy().reset_index(drop=True)
+    
+    if df_zoom.empty:
+        raise ValueError("[HATA] Sorunlu hastalar çıkarıldıktan sonra veri kalmadı.")
+
+    # --------------------------------------------------
+    # 3. Hasta bazlı dataframe oluştur
+    # --------------------------------------------------
+    patient_level_df = df_zoom[["patient_id", "class"]].drop_duplicates().reset_index(drop=True)
+
+    # --------------------------------------------------
+    # 4. V3 ÖZEL: Sınıf Bazlı Garantili Stratified Split
+    # --------------------------------------------------
+    print("\n[BİLGİ] Garantili Katmanlı (Stratified) Bölme işlemi başlatılıyor...")
+    train_p, val_p, test_p = [], [], []
+
+    for cls in patient_level_df["class"].unique():
+        p_list = patient_level_df[patient_level_df["class"] == cls]["patient_id"].tolist()
+        np.random.shuffle(p_list) # Seed ile karıştır
+        n = len(p_list)
+
+        if n == 1:
+            # Sadece 1 hasta varsa mecburen Train'e gider
+            train_p.extend(p_list)
+            print(f"  -> UYARI: '{cls}' sınıfında sadece 1 hasta var. Sadece Train setine eklendi.")
+        elif n == 2:
+            # 2 hasta varsa Train ve Val paylaşır, Test'e kalmaz
+            train_p.append(p_list[0])
+            val_p.append(p_list[1])
+            print(f"  -> UYARI: '{cls}' sınıfında 2 hasta var. Train ve Val setine dağıtıldı (Test=0).")
+        elif n == 3:
+            # 3 hasta varsa her sete 1'er tane garanti verilir
+            train_p.append(p_list[0])
+            val_p.append(p_list[1])
+            test_p.append(p_list[2])
+        else:
+            # 4 ve üzeri hasta varsa oranlara göre dağıt
+            val_count = max(1, int(n * (temp_size / 2)))
+            test_count = max(1, int(n * (temp_size / 2)))
+            train_count = n - val_count - test_count
+
+            train_p.extend(p_list[:train_count])
+            val_p.extend(p_list[train_count:train_count+val_count])
+            test_p.extend(p_list[train_count+val_count:])
+
+    # --------------------------------------------------
+    # 5. Final dataframe'leri oluştur
+    # --------------------------------------------------
+    train_df = df_zoom[df_zoom["patient_id"].isin(train_p)].reset_index(drop=True)
+    val_df   = df_zoom[df_zoom["patient_id"].isin(val_p)].reset_index(drop=True)
+    test_df  = df_zoom[df_zoom["patient_id"].isin(test_p)].reset_index(drop=True)
+
+    # --------------------------------------------------
+    # 6. Sızıntı (Leakage) kontrolü
+    # --------------------------------------------------
+    train_patients = set(train_df["patient_id"].unique())
+    val_patients   = set(val_df["patient_id"].unique())
+    test_patients  = set(test_df["patient_id"].unique())
+
+    if (train_patients & val_patients) or (train_patients & test_patients) or (val_patients & test_patients):
+        raise ValueError("[KARTAL GÖZÜ HATA] Veri sızıntısı (Leakage) tespit edildi! Çakışan hastalar var.")
+    print("\n[BAŞARILI] Veri sızıntısı (Leakage) testi geçildi. Kümeler tamamen izole.")
+
+    # --------------------------------------------------
+    # 7. V3 ÖZEL: Statik Label Mapping
+    # --------------------------------------------------
+    # Veri setinde o an bir sınıf olmasa bile ağın 8 çıkışlı kalmasını sağlar.
+    expected_classes = sorted(expected_classes)
+    class_to_idx = {cls: idx for idx, cls in enumerate(expected_classes)}
+    
+    train_df["label"] = train_df["class"].map(class_to_idx)
+    val_df["label"]   = val_df["class"].map(class_to_idx)
+    test_df["label"]  = test_df["class"].map(class_to_idx)
+
+    # --------------------------------------------------
+    # 8. Özet Rapor
+    # --------------------------------------------------
+    print("\n" + "="*50)
+    print("V3 SPLIT SUMMARY (Görüntü Sayıları)")
+    print("="*50)
+    print(f"{'Split':<12} {'Hastalar':>10} {'Görüntüler':>10}")
+    print("-"*35)
+    print(f"{'Train':<12} {len(train_patients):>10} {len(train_df):>10}")
+    print(f"{'Validation':<12} {len(val_patients):>10} {len(val_df):>10}")
+    print(f"{'Test':<12} {len(test_patients):>10} {len(test_df):>10}")
+    print("="*50)
+
+    print("\n[BİLGİ] Sınıf - İndeks Eşleşmesi (Statik 8 Sınıf):")
+    for cls, idx in class_to_idx.items():
+        print(f"  {cls} -> {idx}")
+
+    return train_df, val_df, test_df, class_to_idx
