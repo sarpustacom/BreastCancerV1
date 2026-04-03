@@ -8,4 +8,10 @@ opencv-python
 opencv-contrib-python
 tensorflow
 ipykernel
+ipywidgets
 tf-keras
+transformers
+torch 
+tqdm
+torchvision
+pillow
