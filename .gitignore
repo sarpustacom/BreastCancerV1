@@ -6,3 +6,4 @@ best_model_classification.keras
 models/
 __pycache__/bk_tools.cpython-311.pyc
 .venv/
+deprecated/BreaKHis_v1
